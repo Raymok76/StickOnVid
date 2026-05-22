@@ -4,6 +4,8 @@ A lightweight, **always-on-top** desktop reference player for stacking YouTube, 
 
 Use it as a floating layout board: VODs, live channels, clips, and `.mp4` / `.webm` files side by side while you work in other apps.
 
+![StickOnVid — YouTube, Twitch, and local video tiles on one always-on-top canvas](sc01.jpg)
+
 ## Features
 
 - **Multi-tile canvas** — up to **4** videos at once (images are unlimited); drag, resize, and arrange freely

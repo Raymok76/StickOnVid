@@ -1,0 +1,423 @@
+:root {
+  --bg: #1a1a1e;
+  --panel: #25252c;
+  --accent: #6b8cff;
+  --text: #e8e8ec;
+  --muted: #888;
+}
+* { box-sizing: border-box; }
+html, body {
+  margin: 0; height: 100%;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  background: var(--bg); color: var(--text);
+  overflow: hidden;
+}
+#titleBar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: stretch;
+  background: var(--panel);
+  border-bottom: 1px solid #333;
+  user-select: none;
+  height: 34px;
+  opacity: 1;
+  pointer-events: auto;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+#titleBar.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-100%);
+}
+.titleBtn {
+  flex: 0 0 auto;
+  align-self: center;
+  margin: 0 8px;
+  padding: 0 10px;
+  height: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  position: relative;
+  z-index: 10;
+}
+.titleBtn:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+.titleBarDrag {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  min-width: 0;
+}
+#titleBar .title { font-weight: 600; white-space: nowrap; }
+#titleBar .hint {
+  font-size: 12px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.windowControls {
+  display: flex;
+  flex-shrink: 0;
+  position: relative;
+  z-index: 1001;
+  pointer-events: auto;
+}
+.winBtn {
+  width: 46px;
+  height: 34px;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  line-height: 1;
+  position: relative;
+  z-index: 1001;
+  pointer-events: auto;
+}
+.winBtn:hover { background: rgba(255, 255, 255, 0.08); }
+.winBtnClose:hover { background: #e81123; color: #fff; }
+#canvas {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  background: #121216;
+  outline: none;
+  isolation: isolate;
+}
+.empty {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--muted); pointer-events: none;
+}
+.tile {
+  position: absolute;
+  border: 2px solid transparent;
+  border-radius: 4px;
+  overflow: hidden;
+  background: #000;
+  min-width: 200px;
+  min-height: 120px;
+  resize: both;
+}
+.tile.selected { border-color: var(--accent); }
+.tileBody {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+.tileBody video,
+.tileBody iframe,
+.tileBody img.tileImage,
+.tileBody > div[id^="tw-"],
+.tileBody .ytEmbedHost {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+.tile-image {
+  background: #0e0e12;
+}
+.tile-image img.tileImage {
+  object-fit: contain;
+  pointer-events: none;
+}
+.tileDragHandle {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 22px;
+  z-index: 4;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  transition: opacity 0.15s ease;
+  opacity: 0;
+  pointer-events: none;
+  background: var(--panel);
+  border-bottom: 1px solid #444;
+}
+.tileDragHandle:active { cursor: grabbing; }
+.tileDragHandleBottom {
+  top: auto;
+  bottom: 0;
+  border-bottom: none;
+  border-top: 1px solid #444;
+}
+.tile-video .tileBody:hover .tileDragHandle,
+.tile-video .tileBody.is-hover .tileDragHandle,
+.tile-video .tileBody:hover .tileDragHandleBottom,
+.tile-video .tileBody.is-hover .tileDragHandleBottom {
+  opacity: 1;
+  pointer-events: auto;
+}
+.tile-embed .tileDragHandle,
+.tile-embed .tileDragHandleBottom {
+  background: transparent;
+  border-bottom: none;
+  border-top: none;
+}
+.tile-embed .tileBody:hover .tileDragHandle,
+.tile-embed .tileBody.is-hover .tileDragHandle,
+.tile-embed .tileBody:hover .tileDragHandleBottom,
+.tile-embed .tileBody.is-hover .tileDragHandleBottom {
+  opacity: 0;
+  pointer-events: auto;
+}
+.tile-embed .tileBody:hover .tileDeleteBtn,
+.tile-embed .tileBody.is-hover .tileDeleteBtn {
+  opacity: 1;
+  pointer-events: auto;
+}
+.tile-image .tileBody:hover .tileDragHandle,
+.tile-image .tileBody.is-hover .tileDragHandle,
+.tile-image .tileBody:hover .tileDragHandleBottom,
+.tile-image .tileBody.is-hover .tileDragHandleBottom {
+  opacity: 1;
+  pointer-events: auto;
+  background: var(--panel);
+  border-bottom: 1px solid #444;
+}
+.tile-image .tileDragHandleBottom {
+  border-top: 1px solid #444;
+}
+/* Twitch embed must stay visible for autoplay (see Twitch Embedded Experiences Requirements). */
+.tile-twitch {
+  min-width: 400px;
+  min-height: 340px;
+}
+.twitchEmbedHost,
+.twitchEmbedHost iframe,
+.tile-twitch .tileBody iframe {
+  visibility: visible !important;
+  opacity: 1 !important;
+}
+.tile-twitch.twitch-paused .twitchEmbedHost iframe {
+  pointer-events: auto !important;
+}
+.tile-twitch.twitch-playing:not(.twitch-needs-activation) .twitchEmbedHost iframe {
+  pointer-events: none !important;
+}
+.tile-twitch .tileBody {
+  display: flex;
+  flex-direction: column;
+}
+.twitchEmbedHost {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 300px;
+  width: 100%;
+  z-index: 1;
+}
+.twitchPlaceholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  color: var(--muted);
+  text-align: center;
+  background: #09090c;
+}
+.ytEmbedHost {
+  z-index: 1;
+}
+.ytPlaceholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  color: var(--muted);
+  text-align: center;
+  background: #09090c;
+  cursor: pointer;
+  user-select: none;
+}
+.ytPlaceholder:hover {
+  color: var(--text);
+}
+/* Bar below the stream — always visible, does not cover the embed. */
+.tile-twitch .twitchControls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  flex: 0 0 auto;
+  z-index: 12;
+  opacity: 1;
+  pointer-events: auto;
+  background: var(--panel);
+  border-top: 1px solid #333;
+  padding: 6px 8px;
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+}
+.tile-twitch .twitchControls:active {
+  cursor: grabbing;
+}
+.tile-twitch .twitchPlayBtn {
+  pointer-events: auto;
+}
+.tile-twitch .twitchMuteBtn,
+.tile-twitch .twitchVolume,
+.tile-twitch .twitchCloseBtn {
+  pointer-events: auto;
+  cursor: pointer;
+}
+.tile-twitch.twitch-needs-activation .twitchEmbedHost iframe {
+  pointer-events: auto !important;
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.twitchPlayBtn {
+  min-width: 5.5rem;
+  font-weight: 600;
+}
+.twitchMuteBtn {
+  width: 28px;
+}
+.twitchVolume {
+  flex: 1 1 auto;
+  min-width: 80px;
+  max-width: 160px;
+}
+.twitchCloseBtn {
+  flex: 0 0 auto;
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.12);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+  padding: 0;
+}
+.twitchCloseBtn:hover {
+  background: #c42b1c;
+  color: #fff;
+}
+.tile-twitch .tileDragHandle {
+  z-index: 10;
+  pointer-events: auto;
+  opacity: 0;
+  cursor: grab;
+  background: transparent;
+}
+.tile-twitch.twitch-paused .tileBody:hover .tileDragHandle,
+.tile-twitch.twitch-paused .tileBody.is-hover .tileDragHandle {
+  opacity: 0.35;
+  background: var(--panel);
+}
+.tile-twitch.twitch-playing .tileDragHandle,
+.tile-twitch.twitch-playing .tileBody:hover .tileDragHandle,
+.tile-twitch.twitch-playing .tileBody.is-hover .tileDragHandle {
+  opacity: 0 !important;
+  pointer-events: none !important;
+  background: transparent !important;
+}
+.tileDeleteBtn {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  z-index: 5;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.tileDeleteBtn:hover {
+  background: #c42b1c;
+}
+.tile-gif .tileControls {
+  bottom: 22px;
+}
+.tile-gif .tileBody:hover .tileControls,
+.tile-gif .tileBody.is-hover .tileControls,
+.tile-gif .tileControls:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+.gifCloseBtn {
+  margin-left: auto;
+}
+.tileControls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px 8px;
+  background: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+.tile-video .tileBody:hover .tileControls,
+.tile-video .tileBody.is-hover .tileControls,
+.tile-video .tileControls:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+.tileControls button {
+  flex: 0 0 auto;
+  border: 0;
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--text);
+  border-radius: 4px;
+  width: 28px;
+  height: 26px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+}
+.tileControls button:hover {
+  background: rgba(255, 255, 255, 0.22);
+}
+.tileControls input[type="range"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+.tileTime {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #ddd;
+  min-width: 72px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.toast {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  padding: 8px 16px; background: #422; border-radius: 6px;
+  font-size: 13px; z-index: 99;
+}
+.toast.hidden { display: none; }

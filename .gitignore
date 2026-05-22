@@ -1,0 +1,7 @@
+node_modules/
+src-tauri/target/
+app-icon.png
+*.log
+CHANGES.md
+twitch_problems01.md
+logo01.ico

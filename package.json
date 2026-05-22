@@ -1,0 +1,17 @@
+{
+  "name": "stickonvid",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "tauri": "node scripts/run-tauri.js",
+    "dev": "node scripts/run-tauri.js dev",
+    "build": "node scripts/run-tauri.js build",
+    "icons": "node scripts/generate-icons.js"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.0"
+  }
+}

@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StickOnVid</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main id="canvas" tabindex="0">
+    <header id="titleBar" class="is-hidden">
+      <div class="titleBarDrag" data-tauri-drag-region>
+        <span class="title">StickOnVid</span>
+        <span class="hint">Paste URL or image (Ctrl+V) · Drop files · Hover tile for drag bar &amp; controls</span>
+      </div>
+      <button type="button" id="btnFitContent" class="titleBtn" title="Shrink window to fit videos">Fit Content</button>
+      <div class="windowControls" data-tauri-drag-region="false">
+        <button type="button" id="btnMinimize" class="winBtn" title="Minimize" aria-label="Minimize">─</button>
+        <button type="button" id="btnMaximize" class="winBtn" title="Maximize" aria-label="Maximize">□</button>
+        <button type="button" id="btnClose" class="winBtn winBtnClose" title="Close" aria-label="Close">✕</button>
+      </div>
+    </header>
+    <p id="emptyState" class="empty">Paste or drop a URL, video (.mp4 / .webm), or image</p>
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

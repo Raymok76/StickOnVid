@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "StickOnVid",
+  "version": "0.1.0",
+  "identifier": "com.stickonvid.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "StickOnVid",
+        "width": 960,
+        "height": 640,
+        "resizable": true,
+        "alwaysOnTop": true,
+        "decorations": false,
+        "center": true,
+        "dragDropEnabled": false,
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,msEnhancedTrackingPrevention,msTrackingPrevention --autoplay-policy=no-user-gesture-required"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' https: data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://www.youtube.com https://s.ytimg.com https://www.google.com https://www.gstatic.com https://player.twitch.tv; frame-src https://www.youtube.com https://www.youtube-nocookie.com https://www.google.com https://player.twitch.tv; connect-src https: wss:; img-src 'self' https: http: data: blob: https://asset.localhost asset:; media-src 'self' blob: https: http: https://asset.localhost asset: data:; style-src 'self' 'unsafe-inline'",
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {}
+}

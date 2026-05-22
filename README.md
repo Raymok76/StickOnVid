@@ -8,6 +8,7 @@ Use it as a floating layout board: VODs, live channels, clips, and `.mp4` / `.we
 
 ## Features
 
+- **Always on top** — window stays above other apps so your reference tiles stay visible while you work
 - **Multi-tile canvas** — up to **4** videos at once (images are unlimited); drag, resize, and arrange freely
 - **Supported sources**
   - YouTube (watch, embed, shorts, `youtu.be`)

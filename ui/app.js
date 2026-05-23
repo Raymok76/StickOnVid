@@ -15,14 +15,26 @@ const STORAGE_KEY = "stickonvid-tiles-v1";
 const FIT_PADDING = 12;
 const YOUTUBE_MOUNT_TIMEOUT_MS = 45000;
 const YOUTUBE_MOUNT_RETRIES = 2;
-/** Matches #titleBar height in styles.css — tiles must start below this overlay. */
+/** Matches #titleBar height in styles.css — used for title bar hit-testing only. */
 const TITLE_BAR_HEIGHT = 34;
+const WINDOW_LABEL = "main";
 /** Bottom play/pause bar height — kept outside the Twitch iframe area. */
 const TWITCH_CONTROLS_HEIGHT = 40;
 const TILE_MARGIN = 12;
+/** Minimum gap between tiles when running Optimal Align. */
+const ALIGN_GAP = 4;
+const GRID_COLS = 2;
+const GRID_ROWS = 2;
+const GRID_SLOTS = GRID_COLS * GRID_ROWS;
 /** Hit area for window edge/corner resize (larger = easier to grab). */
 const WINDOW_RESIZE_MARGIN = 24;
 const TILE_RESIZE_CORNER = 20;
+/** Exponential wheel scaling — works with mouse wheels and trackpads. */
+const TILE_WHEEL_SCALE = 0.001;
+const TILE_MIN_W = 200;
+const TILE_MIN_H = 120;
+const TWITCH_TILE_MIN_W = 400;
+const TWITCH_TILE_MIN_H = 340;
 
 const RESIZE_CURSORS = {
   North: "ns-resize",
@@ -41,18 +53,52 @@ const MAX_VIDEO_TILES = 4;
 const MAX_UNDO = 50;
 let selectedId = null;
 let saveTimer = null;
+/** @type {null | "four-tiles"} */
+let sessionLayoutMode = null;
 /** @type {Array<{ tiles: { source: string, rect: { x: number, y: number, w: number, h: number } }[], selectedId: string | null }>} */
 let undoStack = [];
 /** @type {typeof undoStack} */
 let redoStack = [];
 let applyingHistory = false;
 let twitchApiPromise = null;
-/** Increments so the newest / selected tile stacks above older ones. */
-let topTileZ = 0;
+/** Matches #titleBar z-index in styles.css — keep in sync. */
+const TITLE_BAR_Z_INDEX = 200000;
+/** Twitch iframes sit above the title bar so hover overlays do not pause playback. */
+const TWITCH_Z_BASE = TITLE_BAR_Z_INDEX + 1;
+let normalTopZ = 0;
+let twitchTopZ = TWITCH_Z_BASE - 1;
+let shuttingDown = false;
+
+function hasTauriWindow() {
+  return !!(window.__TAURI_INTERNALS__?.invoke || window.__TAURI__?.core?.invoke);
+}
+
+function hasTwitchTiles(excludeId = null) {
+  for (const tile of tiles.values()) {
+    if (tile.isTwitch && tile.id !== excludeId) return true;
+  }
+  return false;
+}
 
 function bringTileToFront(tile) {
-  topTileZ += 1;
-  tile.el.style.zIndex = String(topTileZ);
+  if (tile.isTwitch) {
+    twitchTopZ += 1;
+    tile.el.style.zIndex = String(twitchTopZ);
+    return;
+  }
+  normalTopZ += 1;
+  tile.el.style.zIndex = String(normalTopZ);
+}
+
+function syncAllTileZIndex() {
+  normalTopZ = 0;
+  twitchTopZ = TWITCH_Z_BASE - 1;
+  for (const tile of tiles.values()) {
+    if (tile.isTwitch) bringTileToFront(tile);
+  }
+  for (const tile of tiles.values()) {
+    if (!tile.isTwitch) bringTileToFront(tile);
+  }
 }
 
 function videoTileCount() {
@@ -73,10 +119,10 @@ class Tile {
     this.autostart = autostart;
     this.deferTwitchMount = deferTwitchMount;
     this.deferYoutubeMount = deferYoutubeMount;
+    this.preserveTileSize = false;
     this.id = id;
     this.parsed = parsed;
     this.blobUrl = null;
-    this.tickHandle = null;
     this.hasCustomControls = parsed.kind === "video" || parsed.kind === "file";
     this.isImage = parsed.kind === "image";
     this.isGif = this.isImage && !!parsed.isGif;
@@ -104,7 +150,7 @@ class Tile {
     const dragTitle = this.hasCustomControls
       ? "Drag top or bottom edge to move video"
       : this.isTwitch
-        ? "Drag top edge to move"
+        ? "Drag bottom control bar or top edge to move"
         : "Drag top or bottom edge to move";
     this.dragHandle.title = dragTitle;
 
@@ -136,13 +182,57 @@ class Tile {
     });
     this.body.addEventListener("mouseleave", () => {
       this.body.classList.remove("is-hover");
+      this.exitYoutubeControlsMode();
     });
   }
 
+  /** Cross-origin YouTube iframes swallow wheel events — shield passes scroll to the canvas. */
+  createYoutubeWheelShield() {
+    const shield = document.createElement("div");
+    shield.className = "ytWheelShield";
+    shield.title = "Scroll to resize · Click to use YouTube controls";
+    shield.addEventListener("click", (e) => {
+      e.stopPropagation();
+      selectTile(this.id);
+      this.enterYoutubeControlsMode();
+    });
+    shield.addEventListener("wheel", (e) => {
+      if (!resizeTileByWheel(e, this)) return;
+      selectTile(this.id);
+      e.preventDefault();
+    }, { passive: false });
+    this.ytWheelShield = shield;
+    this.body.insertBefore(shield, this.dragHandle);
+  }
+
+  enterYoutubeControlsMode() {
+    if (!this.isYoutube || !this.ytFrame) return;
+    this.el.classList.add("yt-controls-mode");
+  }
+
+  exitYoutubeControlsMode() {
+    if (!this.isYoutube) return;
+    this.el.classList.remove("yt-controls-mode");
+  }
+
   maybeResumeTwitchAfterHover() {
-    if (!this.isTwitch || !this.twitchWantsPlay || !this.twitchPlayer) return;
+    if (!this.isTwitch || !this.twitchWantsPlay || this.twitchUserPaused || !this.twitchPlayer) {
+      return;
+    }
+    if (this.el.classList.contains("twitch-needs-activation")) return;
+    this.resumeTwitchPlayback();
+  }
+
+  /** Resume after a spurious pause — no muted bootstrap (that is for first play only). */
+  resumeTwitchPlayback(player = this.twitchPlayer) {
+    if (!player || !this.twitchWantsPlay || this.twitchUserPaused) return;
     if (!this.isTwitchPaused()) return;
-    this.invokeTwitchPlay(this.twitchPlayer);
+    try {
+      const ret = player.play();
+      if (ret && typeof ret.catch === "function") ret.catch(() => {});
+    } catch {
+      /* PAUSE handler may retry */
+    }
   }
 
   createTwitchControls() {
@@ -153,6 +243,7 @@ class Tile {
     this.twitchVolumeValue = 1;
     this.controlsEl = document.createElement("div");
     this.controlsEl.className = "tileControls twitchControls";
+    this.twitchControls = this.controlsEl;
     this.btnPlay = document.createElement("button");
     this.btnPlay.type = "button";
     this.btnPlay.className = "twitchPlayBtn";
@@ -590,8 +681,6 @@ class Tile {
   }
 
   stopSync() {
-    if (this.tickHandle) clearInterval(this.tickHandle);
-    this.tickHandle = null;
     this.backend?.onTimeUpdate?.(null);
   }
 
@@ -636,11 +725,12 @@ class Tile {
 
   mountImage(src) {
     const fileSrc =
-      !src.startsWith("file:") &&
-      !src.startsWith("blob:") &&
-      !/^https?:/i.test(src)
-        ? convertFileSrc(src)
-        : src;
+      src.startsWith("data:") ||
+      src.startsWith("blob:") ||
+      src.startsWith("file:") ||
+      /^https?:/i.test(src)
+        ? src
+        : convertFileSrc(src);
     const img = document.createElement("img");
     img.className = "tileImage";
     img.alt = "";
@@ -651,7 +741,9 @@ class Tile {
     this.body.insertBefore(img, this.dragHandle);
     return new Promise((resolve, reject) => {
       img.addEventListener("load", () => {
-        this.fitImageTileSize(img);
+        if (!this.preserveTileSize) {
+          this.fitImageTileSize(img);
+        }
         this.backend = { kind: this.isGif ? "gif" : "image" };
         this.syncGifControls();
         resolve(this.backend);
@@ -731,6 +823,8 @@ class Tile {
     let lastErr;
     for (let attempt = 0; attempt < YOUTUBE_MOUNT_RETRIES; attempt++) {
       if (attempt > 0) {
+        this.ytWheelShield?.remove();
+        this.ytWheelShield = null;
         this.ytFrame?.remove();
         this.ytFrame = null;
         await new Promise((resolve) => setTimeout(resolve, 1500));
@@ -741,6 +835,8 @@ class Tile {
         lastErr = err;
       }
     }
+    this.ytWheelShield?.remove();
+    this.ytWheelShield = null;
     this.ytFrame?.remove();
     this.ytFrame = null;
     throw lastErr;
@@ -758,20 +854,25 @@ class Tile {
 
     this.body.insertBefore(iframe, this.dragHandle);
     this.ytFrame = iframe;
+    this.createYoutubeWheelShield();
     this.backend = { kind: "youtube" };
 
     return new Promise((resolve, reject) => {
-      const failTimer = setTimeout(() => {
+      clearTimeout(this.youtubeMountFailTimer);
+      this.youtubeMountFailTimer = setTimeout(() => {
+        this.youtubeMountFailTimer = null;
         reject(new Error("YouTube embed timed out"));
       }, YOUTUBE_MOUNT_TIMEOUT_MS);
 
       iframe.addEventListener("load", () => {
-        clearTimeout(failTimer);
+        clearTimeout(this.youtubeMountFailTimer);
+        this.youtubeMountFailTimer = null;
         resolve(this.backend);
       });
 
       iframe.addEventListener("error", () => {
-        clearTimeout(failTimer);
+        clearTimeout(this.youtubeMountFailTimer);
+        this.youtubeMountFailTimer = null;
         reject(new Error("YouTube embed failed to load"));
       });
     });
@@ -836,8 +937,8 @@ class Tile {
           this.setTwitchPlaying(false);
           clearTimeout(this.twitchSpuriousPauseWatch);
           this.twitchSpuriousPauseWatch = setTimeout(() => {
-            if (this.twitchWantsPlay && this.isTwitchPaused()) {
-              this.invokeTwitchPlay(player);
+            if (this.twitchWantsPlay && !this.twitchUserPaused && this.isTwitchPaused()) {
+              this.resumeTwitchPlayback(player);
             }
           }, 80);
         });
@@ -872,18 +973,42 @@ class Tile {
     clearTimeout(this.twitchPlayWatch);
     clearTimeout(this.twitchSpuriousPauseWatch);
     clearTimeout(this.twitchActivationWatch);
+    clearTimeout(this.resizeEndTimer);
+    clearTimeout(this.youtubeMountFailTimer);
+    this.youtubeMountFailTimer = null;
     this.stopSync();
     this.resizeObserver?.disconnect();
+    this.resizeObserver = null;
+    try {
+      this.twitchPlayer?.pause?.();
+    } catch {
+      /* closing anyway */
+    }
     if (this.twitchPlayer) {
       const host = document.getElementById(`tw-${this.id}`);
       if (host) host.replaceChildren();
       this.twitchPlayer = null;
     }
+    this.twitchPlaceholder?.remove();
+    this.twitchPlaceholder = null;
+    const video = this.body?.querySelector("video");
+    if (video) {
+      try {
+        video.pause();
+        video.removeAttribute("src");
+        video.load();
+      } catch {
+        /* closing anyway */
+      }
+    }
     this.ytFrame?.remove();
     this.ytFrame = null;
+    this.ytWheelShield?.remove();
+    this.ytWheelShield = null;
     this.youtubePlaceholder?.remove();
     this.youtubePlaceholder = null;
     if (this.blobUrl) URL.revokeObjectURL(this.blobUrl);
+    this.blobUrl = null;
     this.el.remove();
   }
 }
@@ -921,8 +1046,40 @@ function convertFileSrc(path) {
   return path.startsWith("file:") ? path : `file:///${path.replace(/\\/g, "/")}`;
 }
 
+function readFileAsDataUrl(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ""));
+    reader.onerror = () => reject(reader.error || new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function blobUrlToDataUrl(blobUrl) {
+  const response = await fetch(blobUrl);
+  const blob = await response.blob();
+  return readFileAsDataUrl(blob);
+}
+
+function parsedFromSavedItem(item) {
+  const source = item?.source;
+  if (!source) return { kind: "unknown", url: "" };
+  if (source.startsWith("data:image/")) {
+    return {
+      kind: "image",
+      url: source,
+      isGif: !!item.isGif || isGifSource(source),
+    };
+  }
+  const parsed = parseMediaInput(source);
+  if (parsed.kind === "image" && item.isGif != null) {
+    parsed.isGif = item.isGif;
+  }
+  return parsed;
+}
+
 function minTileTop() {
-  return TITLE_BAR_HEIGHT + TILE_MARGIN;
+  return TITLE_BAR_HEIGHT;
 }
 
 function clampRectBelowTitleBar(rect) {
@@ -938,16 +1095,303 @@ function clampRectBelowTitleBar(rect) {
 function nextTileRect() {
   const n = tiles.size;
   const minY = minTileTop();
-  return { x: TILE_MARGIN + n * 28, y: minY + n * 28, w: 480, h: 270 };
+  return findRectAvoidingTwitch({
+    x: TILE_MARGIN + n * 28,
+    y: minY + n * 28,
+    w: 480,
+    h: 270,
+  });
+}
+
+function rectsOverlap(a, b) {
+  return !(
+    a.x + a.w <= b.x ||
+    b.x + b.w <= a.x ||
+    a.y + a.h <= b.y ||
+    b.y + b.h <= a.y
+  );
+}
+
+function rectsOverlapWithGap(a, b, gap) {
+  return !(
+    a.x + a.w + gap <= b.x ||
+    b.x + b.w + gap <= a.x ||
+    a.y + a.h + gap <= b.y ||
+    b.y + b.h + gap <= a.y
+  );
+}
+
+function layoutItemOverlapsOthers(rect, items, excludeId, gap) {
+  for (const item of items) {
+    if (item.id === excludeId) continue;
+    if (rectsOverlapWithGap(rect, item.rect, gap)) return true;
+  }
+  return false;
+}
+
+function buildLayoutItems() {
+  return [...tiles.values()].map((tile) => {
+    const rect = tileRectFromEl(tile);
+    return {
+      id: tile.id,
+      tile,
+      orig: { ...rect },
+      rect: { ...rect },
+    };
+  });
+}
+
+function findMinimalDisplacementPosition(item, placed, gap) {
+  const { orig, rect } = item;
+  const w = rect.w;
+  const h = rect.h;
+  const minY = minTileTop();
+  const tryAt = (x, y) => {
+    const candidate = {
+      x: Math.max(0, Math.round(x)),
+      y: Math.max(minY, Math.round(y)),
+      w,
+      h,
+    };
+    if (!layoutItemOverlapsOthers(candidate, placed, item.id, gap)) {
+      return candidate;
+    }
+    return null;
+  };
+
+  const atOrigin = tryAt(orig.x, orig.y);
+  if (atOrigin) return atOrigin;
+
+  const step = 8;
+  const maxRadius = 2400;
+  const candidates = [];
+  for (let radius = step; radius <= maxRadius; radius += step) {
+    for (let x = orig.x - radius; x <= orig.x + radius; x += step) {
+      candidates.push({ x, y: orig.y - radius });
+      candidates.push({ x, y: orig.y + radius });
+    }
+    for (let y = orig.y - radius + step; y <= orig.y + radius - step; y += step) {
+      candidates.push({ x: orig.x - radius, y });
+      candidates.push({ x: orig.x + radius, y });
+    }
+  }
+  candidates.sort((a, b) => {
+    const da = (a.x - orig.x) ** 2 + (a.y - orig.y) ** 2;
+    const db = (b.x - orig.x) ** 2 + (b.y - orig.y) ** 2;
+    return da - db;
+  });
+  for (const candidate of candidates) {
+    const placedRect = tryAt(candidate.x, candidate.y);
+    if (placedRect) return placedRect;
+  }
+  return { x: Math.max(0, orig.x), y: Math.max(minY, orig.y), w, h };
+}
+
+function compactLayoutItems(items, gap) {
+  const step = 4;
+  const minY = minTileTop();
+  for (let pass = 0; pass < 12; pass++) {
+    let moved = false;
+    items.sort((a, b) => a.rect.x - b.rect.x || a.rect.y - b.rect.y);
+    for (const item of items) {
+      let nx = item.rect.x;
+      while (nx > 0) {
+        const next = Math.max(0, nx - step);
+        const trial = { ...item.rect, x: next };
+        if (layoutItemOverlapsOthers(trial, items, item.id, gap)) break;
+        nx = next;
+        if (nx === 0) break;
+      }
+      if (nx !== item.rect.x) {
+        item.rect.x = nx;
+        moved = true;
+      }
+    }
+    items.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+    for (const item of items) {
+      let ny = item.rect.y;
+      while (ny > minY) {
+        const next = Math.max(minY, ny - step);
+        const trial = { ...item.rect, y: next };
+        if (layoutItemOverlapsOthers(trial, items, item.id, gap)) break;
+        ny = next;
+        if (ny === minY) break;
+      }
+      if (ny !== item.rect.y) {
+        item.rect.y = ny;
+        moved = true;
+      }
+    }
+    if (!moved) break;
+  }
+}
+
+function computeOptimalTileLayout() {
+  const items = buildLayoutItems();
+  if (items.length === 0) return items;
+  items.sort(
+    (a, b) => a.orig.y - b.orig.y || a.orig.x - b.orig.x || b.rect.w * b.rect.h - a.rect.w * a.rect.h
+  );
+  const placed = [];
+  for (const item of items) {
+    item.rect = findMinimalDisplacementPosition(item, placed, ALIGN_GAP);
+    placed.push(item);
+  }
+  compactLayoutItems(items, ALIGN_GAP);
+  return items;
+}
+
+function shiftTilesToFitPadding() {
+  const { minX, minY } = getTilesBounds();
+  const offsetX = FIT_PADDING - minX;
+  const offsetY = minTileTop() - minY;
+  for (const tile of tiles.values()) {
+    tile.el.style.left = `${tile.el.offsetLeft + offsetX}px`;
+    tile.el.style.top = `${tile.el.offsetTop + offsetY}px`;
+  }
+}
+
+async function setWindowToLogicalSize(width, height, actionLabel) {
+  try {
+    const maximized = await tauriInvoke("plugin:window|is_maximized", { label: WINDOW_LABEL });
+    if (maximized) {
+      await tauriInvoke("plugin:window|toggle_maximize", { label: WINDOW_LABEL });
+    }
+    await tauriInvoke("plugin:window|set_size", {
+      label: WINDOW_LABEL,
+      value: {
+        Logical: {
+          width: Math.max(320, Math.ceil(width)),
+          height: Math.max(180, Math.ceil(height)),
+        },
+      },
+    });
+    flushSaveState();
+  } catch (err) {
+    const msg = String(err?.message || err);
+    if (msg.includes("Tauri IPC unavailable")) {
+      showToast(`${actionLabel} only works in the StickOnVid desktop app`);
+    } else {
+      showToast(`${actionLabel} failed: ${msg}`);
+    }
+    console.error(err);
+  }
+}
+
+async function setWindowToTileBounds(actionLabel) {
+  const { minX, minY, maxX, maxY } = getTilesBounds();
+  const width = maxX - minX + FIT_PADDING * 2;
+  const height = maxY - minY + FIT_PADDING * 2;
+  await setWindowToLogicalSize(width, height, actionLabel);
+}
+
+function getTwitchRects(excludeId = null) {
+  const rects = [];
+  for (const tile of tiles.values()) {
+    if (!tile.isTwitch || tile.id === excludeId) continue;
+    rects.push(tileRectFromEl(tile));
+  }
+  return rects;
+}
+
+function overlapsAnyTwitch(rect, excludeId = null) {
+  return getTwitchRects(excludeId).some((other) => rectsOverlap(rect, other));
+}
+
+function findRectAvoidingTwitch(rect, excludeId = null) {
+  const base = { ...rect };
+  if (!hasTwitchTiles(excludeId) || !overlapsAnyTwitch(base, excludeId)) {
+    return base;
+  }
+
+  const step = TILE_MARGIN + 28;
+  for (let i = 1; i <= 240; i++) {
+    const ring = Math.ceil(i / 8);
+    const angle = i * 0.65;
+    const candidate = {
+      x: Math.round(base.x + Math.cos(angle) * step * ring),
+      y: Math.round(base.y + Math.sin(angle) * step * ring),
+      w: base.w,
+      h: base.h,
+    };
+    if (!overlapsAnyTwitch(candidate, excludeId)) return candidate;
+  }
+  return base;
+}
+
+function tileAtPositionOverlapsTwitch(tile, x, y) {
+  return overlapsAnyTwitch(
+    {
+      x,
+      y,
+      w: tile.el.offsetWidth,
+      h: tile.el.offsetHeight,
+    },
+    tile.id
+  );
+}
+
+function resolveTilePlacementsAvoidingTwitch() {
+  for (const tile of tiles.values()) {
+    let rect = tileRectFromEl(tile);
+    rect = findRectAvoidingTwitch(rect, tile.id);
+    rect = clampRectBelowTitleBar(rect);
+    if (
+      rect.x !== tile.el.offsetLeft ||
+      rect.y !== tile.el.offsetTop ||
+      rect.w !== tile.el.offsetWidth ||
+      rect.h !== tile.el.offsetHeight
+    ) {
+      applyTileRect(tile, rect);
+    }
+  }
+}
+
+function clearSessionLayoutMode() {
+  sessionLayoutMode = null;
 }
 
 function tileRectFromEl(tile) {
+  const parsedLeft = parseInt(tile.el.style.left, 10);
+  const parsedTop = parseInt(tile.el.style.top, 10);
+  const parsedW = parseInt(tile.el.style.width, 10);
+  const parsedH = parseInt(tile.el.style.height, 10);
   return {
-    x: tile.el.offsetLeft,
-    y: tile.el.offsetTop,
-    w: tile.el.offsetWidth,
-    h: tile.el.offsetHeight,
+    x: Number.isFinite(parsedLeft) ? parsedLeft : tile.el.offsetLeft,
+    y: Number.isFinite(parsedTop) ? parsedTop : tile.el.offsetTop,
+    w: Number.isFinite(parsedW) ? parsedW : tile.el.offsetWidth,
+    h: Number.isFinite(parsedH) ? parsedH : tile.el.offsetHeight,
   };
+}
+
+function applyTileRect(tile, rect) {
+  tile.el.style.left = `${rect.x}px`;
+  tile.el.style.top = `${rect.y}px`;
+  tile.el.style.width = `${rect.w}px`;
+  tile.el.style.height = `${rect.h}px`;
+}
+
+function tileContentKey(parsed) {
+  return `${parsed.kind}|${parsed.url}|${parsed.id || ""}|${JSON.stringify(parsed.twitch || null)}`;
+}
+
+function sameTileContent(tile, parsed) {
+  return tileContentKey(tile.parsed) === tileContentKey(parsed);
+}
+
+function parsedFromSnapshotItem(item) {
+  const parsed =
+    item.parsed ||
+    (item.source ? parseMediaInput(item.source) : { kind: "unknown", url: "" });
+  if (parsed.kind === "image" && parsed.isGif == null) {
+    parsed.isGif = isGifSource(parsed.url);
+  }
+  return parsed;
+}
+
+function snapshotUsesStableIds(snap) {
+  const items = snap.tiles || [];
+  return items.length > 0 && items.every((item) => item.id);
 }
 
 function serializeDocument() {
@@ -956,6 +1400,7 @@ function serializeDocument() {
     const url = tile.parsed.url;
     if (!url) continue;
     items.push({
+      id: tile.id,
       parsed: {
         kind: tile.parsed.kind,
         url: tile.parsed.url,
@@ -964,6 +1409,7 @@ function serializeDocument() {
         isGif: tile.parsed.isGif,
       },
       rect: tileRectFromEl(tile),
+      zIndex: Number(tile.el.style.zIndex) || 0,
     });
   }
   return { tiles: items, selectedId };
@@ -976,8 +1422,7 @@ function pushUndoSnapshot() {
   if (undoStack.length > MAX_UNDO) undoStack.shift();
 }
 
-async function restoreFromSnapshot(snap) {
-  applyingHistory = true;
+async function restoreFromSnapshotLegacy(snap) {
   for (const id of [...tiles.keys()]) {
     const tile = tiles.get(id);
     tile?.destroy();
@@ -985,13 +1430,8 @@ async function restoreFromSnapshot(snap) {
   }
   selectedId = null;
   for (const item of snap.tiles || []) {
-    const parsed =
-      item.parsed ||
-      (item.source ? parseMediaInput(item.source) : { kind: "unknown", url: "" });
+    const parsed = parsedFromSnapshotItem(item);
     if (parsed.kind === "unknown") continue;
-    if (parsed.kind === "image" && parsed.isGif == null) {
-      parsed.isGif = isGifSource(parsed.url);
-    }
     await addTile(parsed, item.rect, {
       autostart: false,
       skipHistory: true,
@@ -1002,7 +1442,80 @@ async function restoreFromSnapshot(snap) {
   if (snap.selectedId && tiles.has(snap.selectedId)) {
     selectTile(snap.selectedId);
   }
+  resolveTilePlacementsAvoidingTwitch();
+  syncAllTileZIndex();
   emptyState.classList.toggle("hidden", tiles.size > 0);
+}
+
+async function restoreFromSnapshotInPlace(snap) {
+  const snapItems = (snap.tiles || []).filter((item) => {
+    const parsed = parsedFromSnapshotItem(item);
+    return parsed.kind !== "unknown";
+  });
+  const keptIds = new Set();
+
+  for (const item of snapItems) {
+    const parsed = parsedFromSnapshotItem(item);
+    const rect = item.rect || nextTileRect();
+    const existing = item.id ? tiles.get(item.id) : null;
+
+    if (existing && sameTileContent(existing, parsed)) {
+      applyTileRect(existing, rect);
+      if (item.zIndex != null && existing.isTwitch) {
+        existing.el.style.zIndex = String(item.zIndex);
+        twitchTopZ = Math.max(twitchTopZ, item.zIndex);
+      }
+      keptIds.add(existing.id);
+      continue;
+    }
+
+    if (existing) {
+      existing.destroy();
+      tiles.delete(existing.id);
+    }
+
+    await addTile(parsed, rect, {
+      id: item.id,
+      autostart: false,
+      skipHistory: true,
+      deferTwitchMount: parsed.kind === "twitch",
+      deferYoutubeMount: parsed.kind === "youtube",
+    });
+    if (item.id) {
+      keptIds.add(item.id);
+      const created = tiles.get(item.id);
+      if (created && item.zIndex != null && created.isTwitch) {
+        created.el.style.zIndex = String(item.zIndex);
+        twitchTopZ = Math.max(twitchTopZ, item.zIndex);
+      }
+    }
+  }
+
+  for (const id of [...tiles.keys()]) {
+    if (keptIds.has(id)) continue;
+    tiles.get(id)?.destroy();
+    tiles.delete(id);
+  }
+
+  resolveTilePlacementsAvoidingTwitch();
+  syncAllTileZIndex();
+
+  selectedId = null;
+  if (snap.selectedId && tiles.has(snap.selectedId)) {
+    selectTile(snap.selectedId);
+  } else {
+    for (const tile of tiles.values()) tile.deselect();
+  }
+  emptyState.classList.toggle("hidden", tiles.size > 0);
+}
+
+async function restoreFromSnapshot(snap) {
+  applyingHistory = true;
+  if (snapshotUsesStableIds(snap)) {
+    await restoreFromSnapshotInPlace(snap);
+  } else {
+    await restoreFromSnapshotLegacy(snap);
+  }
   applyingHistory = false;
   scheduleSaveState();
 }
@@ -1030,25 +1543,33 @@ function isHistoryKeyTarget(el) {
 function beginTileDrag(e, tile, id, captureEl) {
   e.preventDefault();
   e.stopPropagation();
+  clearSessionLayoutMode();
   pushUndoSnapshot();
   selectTile(id);
 
   const startX = e.clientX;
   const startY = e.clientY;
-  const rect = canvas.getBoundingClientRect();
   const startLeft = tile.el.offsetLeft;
   const startTop = tile.el.offsetTop;
-  const minY = minTileTop();
+  let lastLeft = startLeft;
+  let lastTop = startTop;
 
   captureEl.setPointerCapture(e.pointerId);
 
   const onMove = (ev) => {
     const dx = ev.clientX - startX;
     const dy = ev.clientY - startY;
-    const maxX = Math.max(0, rect.width - tile.el.offsetWidth);
-    const maxY = Math.max(minY, rect.height - tile.el.offsetHeight);
-    tile.el.style.left = `${Math.min(maxX, Math.max(0, startLeft + dx))}px`;
-    tile.el.style.top = `${Math.min(maxY, Math.max(minY, startTop + dy))}px`;
+    const nextLeft = startLeft + dx;
+    const nextTop = startTop + dy;
+    if (tileAtPositionOverlapsTwitch(tile, nextLeft, nextTop)) {
+      tile.el.style.left = `${lastLeft}px`;
+      tile.el.style.top = `${lastTop}px`;
+      return;
+    }
+    tile.el.style.left = `${nextLeft}px`;
+    tile.el.style.top = `${nextTop}px`;
+    lastLeft = nextLeft;
+    lastTop = nextTop;
   };
 
   const onUp = (ev) => {
@@ -1092,16 +1613,97 @@ function observeTileResize(tile) {
   tile.resizeObserver.observe(tile.el);
 }
 
-function tileSnapshot(tile) {
-  return {
-    source: tile.parsed.url,
-    rect: {
-      x: tile.el.offsetLeft,
-      y: tile.el.offsetTop,
-      w: tile.el.offsetWidth,
-      h: tile.el.offsetHeight,
-    },
-  };
+function tileMinSize(tile) {
+  if (tile.isTwitch) {
+    return { w: TWITCH_TILE_MIN_W, h: TWITCH_TILE_MIN_H };
+  }
+  return { w: TILE_MIN_W, h: TILE_MIN_H };
+}
+
+function findTileAtPoint(clientX, clientY, { videoOnly = false } = {}) {
+  let best = null;
+  let bestZ = -1;
+  for (const tile of tiles.values()) {
+    if (videoOnly && tile.isImage) continue;
+    const bounds = tile.el.getBoundingClientRect();
+    if (
+      clientX < bounds.left ||
+      clientX > bounds.right ||
+      clientY < bounds.top ||
+      clientY > bounds.bottom
+    ) {
+      continue;
+    }
+    const z = Number(tile.el.style.zIndex) || 0;
+    if (z >= bestZ) {
+      bestZ = z;
+      best = tile;
+    }
+  }
+  return best;
+}
+
+function isWheelResizeBlockedTarget(el) {
+  if (!el || !(el instanceof HTMLElement)) return false;
+  if (isHistoryKeyTarget(el)) return true;
+  return !!el.closest?.(
+    "#titleBar, .titleBtn, .winBtn, .windowControls, .tileControls input, .twitchVolume"
+  );
+}
+
+function resizeTileByWheel(e, tile) {
+  const bounds = tile.el.getBoundingClientRect();
+  if (
+    e.clientX < bounds.left ||
+    e.clientX > bounds.right ||
+    e.clientY < bounds.top ||
+    e.clientY > bounds.bottom
+  ) {
+    return false;
+  }
+
+  const w = tile.el.offsetWidth;
+  const h = tile.el.offsetHeight;
+  const factor = Math.pow(1 + TILE_WHEEL_SCALE, -e.deltaY);
+  const min = tileMinSize(tile);
+  const newW = Math.max(min.w, Math.round(w * factor));
+  const newH = Math.max(min.h, Math.round(h * factor));
+  if (newW === w && newH === h) return true;
+
+  const anchorX = (e.clientX - bounds.left) / w;
+  const anchorY = (e.clientY - bounds.top) / h;
+  let left = tile.el.offsetLeft + (w - newW) * anchorX;
+  let top = tile.el.offsetTop + (h - newH) * anchorY;
+
+  if (tileAtPositionOverlapsTwitch(tile, left, top)) return true;
+
+  applyTileRect(tile, {
+    x: Math.round(left),
+    y: Math.round(top),
+    w: newW,
+    h: newH,
+  });
+  return true;
+}
+
+function handleTileWheel(e) {
+  if (isWheelResizeBlockedTarget(e.target)) return;
+  const tile = findTileAtPoint(e.clientX, e.clientY);
+  if (!tile) return;
+  if (!resizeTileByWheel(e, tile)) return;
+  selectTile(tile.id);
+  e.preventDefault();
+}
+
+function initTileWheelResize() {
+  canvas.addEventListener("wheel", handleTileWheel, { passive: false });
+}
+
+function tileSnapshot(tile, source = tile.parsed.url) {
+  const rect = tileRectFromEl(tile);
+  const snap = { source, rect };
+  if (tile.isGif) snap.isGif = true;
+  return snap;
 }
 
 function readSavedPayload() {
@@ -1116,23 +1718,46 @@ function readSavedPayload() {
 
 function scheduleSaveState() {
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveState, 300);
+  saveTimer = setTimeout(() => {
+    void saveStateAsync();
+  }, 300);
 }
 
 function flushSaveState() {
   clearTimeout(saveTimer);
-  saveState();
+  return saveStateAsync();
 }
 
-function saveState() {
+async function resolvePersistableSource(tile) {
+  const url = tile.parsed.url;
+  if (!url) return null;
+  if (url.startsWith("blob:")) {
+    if (!tile.isImage) return null;
+    if (!tile.persistedDataUrl) {
+      tile.persistedDataUrl = await blobUrlToDataUrl(url);
+    }
+    return tile.persistedDataUrl;
+  }
+  return url;
+}
+
+async function saveStateAsync() {
   const items = [];
   for (const tile of tiles.values()) {
-    const url = tile.parsed.url;
-    if (!url || url.startsWith("blob:")) continue;
-    items.push(tileSnapshot(tile));
+    let source;
+    try {
+      source = await resolvePersistableSource(tile);
+    } catch {
+      continue;
+    }
+    if (!source || source.startsWith("blob:")) continue;
+    items.push(tileSnapshot(tile, source));
   }
   const payload = { tiles: items };
-  if (window.__TAURI_INTERNALS__?.invoke || window.__TAURI__?.core?.invoke) {
+  if (sessionLayoutMode) {
+    payload.layout = sessionLayoutMode;
+  }
+  if (hasTauriWindow()) {
     payload.window = {
       width: window.innerWidth,
       height: window.innerHeight,
@@ -1140,8 +1765,11 @@ function saveState() {
   }
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-  } catch {
-    /* quota or private mode */
+  } catch (err) {
+    console.warn("Could not save session:", err);
+    if (items.some((item) => item.source?.startsWith("data:image/"))) {
+      showToast("Session save failed — image may be too large for storage");
+    }
   }
 }
 
@@ -1150,17 +1778,18 @@ async function restoreSavedWindowSize() {
   const w = data?.window?.width;
   const h = data?.window?.height;
   if (!w || !h) return;
-  if (!window.__TAURI_INTERNALS__?.invoke && !window.__TAURI__?.core?.invoke) {
+  if (!hasTauriWindow()) {
     return;
   }
-  const label = "main";
   try {
-    const maximized = await tauriInvoke("plugin:window|is_maximized", { label });
+    const maximized = await tauriInvoke("plugin:window|is_maximized", {
+      label: WINDOW_LABEL,
+    });
     if (maximized) {
-      await tauriInvoke("plugin:window|toggle_maximize", { label });
+      await tauriInvoke("plugin:window|toggle_maximize", { label: WINDOW_LABEL });
     }
     await tauriInvoke("plugin:window|set_size", {
-      label,
+      label: WINDOW_LABEL,
       value: {
         Logical: {
           width: Math.max(320, Math.round(w)),
@@ -1176,7 +1805,7 @@ async function restoreSavedWindowSize() {
 function initWindowSizePersistence() {
   let resizeTimer = null;
   window.addEventListener("resize", () => {
-    if (!window.__TAURI_INTERNALS__?.invoke && !window.__TAURI__?.core?.invoke) {
+    if (!hasTauriWindow()) {
       return;
     }
     clearTimeout(resizeTimer);
@@ -1208,43 +1837,171 @@ async function fitContentToTiles() {
     showToast("Add a video first");
     return;
   }
-  const { minX, minY, maxX, maxY } = getTilesBounds();
-  const topInset = minTileTop();
-  const width = Math.ceil(maxX - minX + FIT_PADDING * 2);
-  const height = Math.ceil(maxY - minY + topInset + FIT_PADDING);
-  const offsetX = FIT_PADDING - minX;
-  const offsetY = topInset - minY;
+  clearSessionLayoutMode();
+  pushUndoSnapshot();
+  shiftTilesToFitPadding();
+  await setWindowToTileBounds("Fit Content");
+  flushSaveState();
+}
 
-  for (const tile of tiles.values()) {
-    tile.el.style.left = `${tile.el.offsetLeft + offsetX}px`;
-    tile.el.style.top = `${tile.el.offsetTop + offsetY}px`;
+async function optimalAlignToTiles() {
+  if (tiles.size === 0) {
+    showToast("Add a video first");
+    return;
+  }
+  clearSessionLayoutMode();
+  pushUndoSnapshot();
+  for (const item of computeOptimalTileLayout()) {
+    applyTileRect(item.tile, item.rect);
+  }
+  shiftTilesToFitPadding();
+  await setWindowToTileBounds("Optimal Align");
+  flushSaveState();
+}
+
+function sortTilesByPosition(tileList) {
+  return [...tileList].sort((a, b) => {
+    const ra = tileRectFromEl(a);
+    const rb = tileRectFromEl(b);
+    return ra.y - rb.y || ra.x - rb.x || a.id.localeCompare(b.id);
+  });
+}
+
+function fourTilesGridCell(slotIndex, cellW, cellH) {
+  const col = slotIndex % GRID_COLS;
+  const row = Math.floor(slotIndex / GRID_COLS);
+  const minY = minTileTop();
+  return {
+    x: col * cellW,
+    y: minY + row * cellH,
+    w: cellW,
+    h: cellH,
+  };
+}
+
+function computeFourTilesLayout() {
+  const videoTiles = sortTilesByPosition(
+    [...tiles.values()].filter((tile) => !tile.isImage)
+  );
+  const imageTiles = sortTilesByPosition(
+    [...tiles.values()].filter((tile) => tile.isImage)
+  );
+  if (videoTiles.length === 0 && imageTiles.length === 0) {
+    return null;
   }
 
-  try {
-    const label = "main";
-    const maximized = await tauriInvoke("plugin:window|is_maximized", { label });
-    if (maximized) {
-      await tauriInvoke("plugin:window|toggle_maximize", { label });
-    }
-    await tauriInvoke("plugin:window|set_size", {
-      label,
-      value: {
-        Logical: {
-          width: Math.max(320, width),
-          height: Math.max(180, height),
-        },
-      },
-    });
-    flushSaveState();
-  } catch (err) {
-    const msg = String(err?.message || err);
-    if (msg.includes("Tauri IPC unavailable")) {
-      showToast("Fit Content only works in the StickOnVid desktop app");
-    } else {
-      showToast(`Fit Content failed: ${msg}`);
-    }
-    console.error(err);
+  const minY = minTileTop();
+  const cellW = Math.max(1, Math.floor(canvas.clientWidth / GRID_COLS));
+  const cellH = Math.max(1, Math.floor((canvas.clientHeight - minY) / GRID_ROWS));
+
+  const placements = [];
+  const videosInGrid = videoTiles.slice(0, GRID_SLOTS);
+  for (let slot = 0; slot < videosInGrid.length; slot++) {
+    placements.push({ tile: videosInGrid[slot], ...fourTilesGridCell(slot, cellW, cellH) });
   }
+
+  const videoSlotCount = videosInGrid.length;
+  if (videoSlotCount === GRID_SLOTS && imageTiles.length > 0) {
+    const cell = fourTilesGridCell(GRID_SLOTS - 1, cellW, cellH);
+    for (const tile of imageTiles) {
+      placements.push({ tile, ...cell });
+    }
+  } else if (videoSlotCount < GRID_SLOTS && imageTiles.length > 0) {
+    const freeSlots = [];
+    for (let slot = videoSlotCount; slot < GRID_SLOTS; slot++) {
+      freeSlots.push(slot);
+    }
+    const perSlot = Math.floor(imageTiles.length / freeSlots.length);
+    const remainder = imageTiles.length % freeSlots.length;
+    let imageIndex = 0;
+    for (let i = 0; i < freeSlots.length; i++) {
+      const count = perSlot + (i < remainder ? 1 : 0);
+      const cell = fourTilesGridCell(freeSlots[i], cellW, cellH);
+      for (let j = 0; j < count; j++) {
+        placements.push({ tile: imageTiles[imageIndex++], ...cell });
+      }
+    }
+  }
+
+  return { placements };
+}
+
+function pauseTileAfterLayout(tile) {
+  if (tile.isImage) return;
+  if (tile.isGif) {
+    if (!tile.gifPaused) tile.toggleGifPlay?.();
+    return;
+  }
+  if (tile.hasCustomControls) {
+    const video = tile.body?.querySelector("video");
+    if (video) video.pause();
+    tile.syncControls?.();
+    return;
+  }
+  if (tile.isTwitch && tile.twitchPlayer) {
+    try {
+      tile.twitchPlayer.pause();
+    } catch {
+      /* ignore Twitch embed errors */
+    }
+    tile.twitchUserPaused = false;
+    tile.setTwitchPlaying(false);
+    return;
+  }
+  if (tile.isYoutube && tile.ytFrame?.src) {
+    try {
+      const url = new URL(tile.ytFrame.src);
+      if (url.searchParams.get("autoplay") === "1") {
+        url.searchParams.set("autoplay", "0");
+        tile.ytFrame.src = url.toString();
+      }
+    } catch {
+      /* ignore URL parse errors */
+    }
+  }
+}
+
+function applyFourTilesLayout({ pushUndo = false, pausePlayback = true, save = true } = {}) {
+  if (tiles.size === 0) return false;
+  const layout = computeFourTilesLayout();
+  if (!layout) return false;
+  if (pushUndo) pushUndoSnapshot();
+
+  const overlapGroups = new Map();
+  for (const { tile, x, y, w, h } of layout.placements) {
+    tile.preserveTileSize = true;
+    applyTileRect(tile, { x, y, w, h });
+    if (pausePlayback) pauseTileAfterLayout(tile);
+    const key = `${x},${y}`;
+    if (!overlapGroups.has(key)) overlapGroups.set(key, []);
+    overlapGroups.get(key).push(tile);
+  }
+  for (const group of overlapGroups.values()) {
+    if (group.length > 1) {
+      for (const tile of group) {
+        bringTileToFront(tile);
+      }
+    }
+  }
+
+  sessionLayoutMode = "four-tiles";
+  if (save) {
+    void flushSaveStateAfterLayout();
+  }
+  return true;
+}
+
+function layoutFourTiles() {
+  if (tiles.size === 0) {
+    showToast("Add a tile first");
+    return;
+  }
+  applyFourTilesLayout({ pushUndo: true, pausePlayback: true, save: true });
+}
+
+async function flushSaveStateAfterLayout() {
+  await new Promise((resolve) => requestAnimationFrame(resolve));
+  return saveStateAsync();
 }
 
 function waitForTwitchApi() {
@@ -1288,21 +2045,35 @@ async function loadSavedTiles() {
   );
 
   await restoreSavedWindowSize();
+  await new Promise((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(resolve))
+  );
 
   const data = readSavedPayload();
   if (!data) return;
+  sessionLayoutMode = data.layout === "four-tiles" ? "four-tiles" : null;
+
   for (const item of data.tiles || []) {
     if (!item?.source) continue;
-    const parsed = parseMediaInput(item.source);
+    const parsed = parsedFromSavedItem(item);
     if (parsed.kind === "unknown") continue;
     const rect = item.rect || nextTileRect();
     await addTile(parsed, rect, {
       autostart: false,
       skipHistory: true,
+      preservePlacement: sessionLayoutMode !== "four-tiles",
+      preserveTileSize: !!(rect.w && rect.h),
       deferTwitchMount: parsed.kind === "twitch",
       deferYoutubeMount: parsed.kind === "youtube",
     });
   }
+
+  if (sessionLayoutMode === "four-tiles") {
+    applyFourTilesLayout({ pushUndo: false, pausePlayback: false, save: false });
+  }
+
+  syncAllTileZIndex();
+  flushSaveState();
 }
 
 function initTitleBarVisibility() {
@@ -1406,11 +2177,9 @@ function tryStartWindowResize(e) {
   if (isTitleBarControl(e.target)) return false;
   const dir = getWindowResizeHit(e.clientX, e.clientY);
   if (!dir) return false;
-  const hasTauri =
-    window.__TAURI_INTERNALS__?.invoke || window.__TAURI__?.core?.invoke;
-  if (!hasTauri) return false;
+  if (!hasTauriWindow()) return false;
   tauriInvoke("plugin:window|start_resize_dragging", {
-    label: "main",
+    label: WINDOW_LABEL,
     value: dir,
   }).catch(() => {});
   return true;
@@ -1419,9 +2188,7 @@ function tryStartWindowResize(e) {
 function tryStartWindowDrag(e) {
   if (e.button !== 0) return false;
   if (!shouldShowTopBarGrab(e.clientX, e.clientY)) return false;
-  const hasTauri =
-    window.__TAURI_INTERNALS__?.invoke || window.__TAURI__?.core?.invoke;
-  if (hasTauri) {
+  if (hasTauriWindow()) {
     document.body.style.cursor = "grabbing";
     const endGrab = () => {
       clearTopBarCursor();
@@ -1430,7 +2197,7 @@ function tryStartWindowDrag(e) {
     };
     document.addEventListener("pointerup", endGrab);
     document.addEventListener("pointercancel", endGrab);
-    tauriInvoke("plugin:window|start_dragging", { label: "main" }).catch(
+    tauriInvoke("plugin:window|start_dragging", { label: WINDOW_LABEL }).catch(
       () => {}
     );
   }
@@ -1468,10 +2235,13 @@ async function addTile(
   parsed,
   rect,
   {
+    id: presetId = null,
     autostart = true,
     skipHistory = false,
     deferTwitchMount = false,
     deferYoutubeMount = false,
+    preservePlacement = false,
+    preserveTileSize = false,
   } = {}
 ) {
   if (parsed.kind !== "image" && videoTileCount() >= MAX_VIDEO_TILES) {
@@ -1480,12 +2250,21 @@ async function addTile(
   }
   if (!skipHistory) pushUndoSnapshot();
   emptyState.classList.add("hidden");
-  const id = crypto.randomUUID();
-  const tile = new Tile(id, parsed, clampRectBelowTitleBar(rect || nextTileRect()), {
+  const id = presetId || crypto.randomUUID();
+  if (tiles.has(id)) {
+    tiles.get(id)?.destroy();
+    tiles.delete(id);
+  }
+  const rawRect = clampRectBelowTitleBar(rect || nextTileRect());
+  const placement = preservePlacement
+    ? rawRect
+    : findRectAvoidingTwitch(rawRect, presetId);
+  const tile = new Tile(id, parsed, placement, {
     autostart,
     deferTwitchMount,
     deferYoutubeMount,
   });
+  tile.preserveTileSize = preserveTileSize;
   if (parsed.url?.startsWith("blob:")) tile.blobUrl = parsed.url;
   tiles.set(id, tile);
   canvas.appendChild(tile.el);
@@ -1530,17 +2309,26 @@ async function addFromText(text) {
 }
 
 async function addFromBlob(file) {
-  const url = URL.createObjectURL(file);
   const isImage =
     file.type.startsWith("image/") || isImageExtension(file.name);
   const kind = isImage ? "image" : "video";
   if (kind === "video" && !isVideoExtension(file.name) && !file.type.startsWith("video/")) {
     showToast(`Unsupported file: ${file.name}`);
-    URL.revokeObjectURL(url);
     return;
   }
   const isGif = isImage && (file.type === "image/gif" || isGifSource(file.name));
-  await addTile({ kind, url, isGif });
+  if (isImage) {
+    try {
+      const dataUrl = await readFileAsDataUrl(file);
+      await addTile({ kind: "image", url: dataUrl, isGif });
+      return;
+    } catch {
+      showToast(`Could not import image: ${file.name}`);
+      return;
+    }
+  }
+  const url = URL.createObjectURL(file);
+  await addTile({ kind: "video", url });
 }
 
 async function addFromPaths(paths) {
@@ -1585,16 +2373,189 @@ function deleteSelectedTile() {
   if (selectedId) deleteTile(selectedId);
 }
 
-function destroyEmbedsBeforeClose() {
-  for (const tile of tiles.values()) {
-    if (!tile.isTwitch) continue;
-    try {
-      tile.twitchPlayer?.pause?.();
-    } catch {
-      /* closing anyway */
-    }
-    tile.destroy();
+function destroyAllTilesBeforeClose() {
+  for (const id of [...tiles.keys()]) {
+    tiles.get(id)?.destroy();
+    tiles.delete(id);
   }
+  selectedId = null;
+}
+
+async function prepareForShutdown() {
+  await flushSaveState();
+  destroyAllTilesBeforeClose();
+}
+
+async function closeAppWindow() {
+  if (!hasTauriWindow()) {
+    window.close();
+    return;
+  }
+  const getCurrentWindow = window.__TAURI__?.window?.getCurrentWindow;
+  if (typeof getCurrentWindow === "function") {
+    await getCurrentWindow().close();
+    return;
+  }
+  await tauriInvoke("plugin:window|close", { label: WINDOW_LABEL });
+}
+
+async function runShutdownAndClose() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await prepareForShutdown();
+    await closeAppWindow();
+  } catch (err) {
+    shuttingDown = false;
+    console.error("Failed to close:", err);
+    throw err;
+  }
+}
+
+async function quitProgram() {
+  await runShutdownAndClose().catch(() => {});
+}
+
+async function initCloseHandling() {
+  if (!hasTauriWindow()) return;
+  const getCurrentWindow = window.__TAURI__?.window?.getCurrentWindow;
+  if (typeof getCurrentWindow !== "function") return;
+  try {
+    const appWindow = getCurrentWindow();
+    await appWindow.onCloseRequested(async (event) => {
+      if (shuttingDown) return;
+      event.preventDefault();
+      await runShutdownAndClose().catch(() => {});
+    });
+  } catch (err) {
+    console.warn("Could not register close handler:", err);
+  }
+}
+
+let canvasContextMenu = null;
+let contextMenuVideoTileId = null;
+
+function hideCanvasContextMenu() {
+  canvasContextMenu?.classList.add("hidden");
+  contextMenuVideoTileId = null;
+}
+
+function updateCanvasContextMenu(clientX, clientY) {
+  const closeBtn = canvasContextMenu?.querySelector('[data-action="close-video"]');
+  const tile = findTileAtPoint(clientX, clientY, { videoOnly: true });
+  contextMenuVideoTileId = tile?.id ?? null;
+  if (closeBtn) {
+    closeBtn.disabled = !tile;
+  }
+}
+
+function showCanvasContextMenu(clientX, clientY) {
+  if (!canvasContextMenu) return;
+  updateCanvasContextMenu(clientX, clientY);
+  canvasContextMenu.classList.remove("hidden");
+  canvasContextMenu.style.left = `${clientX}px`;
+  canvasContextMenu.style.top = `${clientY}px`;
+  requestAnimationFrame(() => {
+    const menu = canvasContextMenu;
+    if (!menu) return;
+    const pad = 8;
+    const rect = menu.getBoundingClientRect();
+    let x = clientX;
+    let y = clientY;
+    if (rect.right > window.innerWidth - pad) {
+      x = window.innerWidth - rect.width - pad;
+    }
+    if (rect.bottom > window.innerHeight - pad) {
+      y = window.innerHeight - rect.height - pad;
+    }
+    if (x < pad) x = pad;
+    if (y < pad) y = pad;
+    menu.style.left = `${x}px`;
+    menu.style.top = `${y}px`;
+  });
+}
+
+async function syncMaximizeButtonIcon() {
+  const btnMaximize = document.getElementById("btnMaximize");
+  if (!btnMaximize || !hasTauriWindow()) return;
+  try {
+    const maximized = await tauriInvoke("plugin:window|is_maximized", {
+      label: WINDOW_LABEL,
+    });
+    btnMaximize.textContent = maximized ? "❐" : "□";
+    btnMaximize.title = maximized ? "Restore" : "Maximize";
+  } catch {
+    /* ignore */
+  }
+}
+
+async function minimizeWindow() {
+  if (!hasTauriWindow()) {
+    showToast("Minimize only works in the StickOnVid desktop app");
+    return;
+  }
+  await tauriInvoke("plugin:window|minimize", { label: WINDOW_LABEL }).catch(console.error);
+}
+
+async function toggleMaximizeWindow() {
+  if (!hasTauriWindow()) {
+    showToast("Maximize only works in the StickOnVid desktop app");
+    return;
+  }
+  try {
+    await tauriInvoke("plugin:window|toggle_maximize", { label: WINDOW_LABEL });
+    await syncMaximizeButtonIcon();
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+function initCanvasContextMenu() {
+  canvasContextMenu = document.createElement("div");
+  canvasContextMenu.id = "canvasContextMenu";
+  canvasContextMenu.className = "canvasContextMenu hidden";
+  canvasContextMenu.innerHTML = `
+    <button type="button" data-action="fit">Fit Content<span class="ctxShortcut">Ctrl+F</span></button>
+    <button type="button" data-action="align">Optimal Align<span class="ctxShortcut">Ctrl+O</span></button>
+    <button type="button" data-action="four-tiles">4-Tiles<span class="ctxShortcut">Ctrl+T</span></button>
+    <button type="button" data-action="close-video" disabled>Close Video</button>
+    <button type="button" data-action="minimize">Minimize Window</button>
+    <button type="button" data-action="maximize">Maximize Window</button>
+    <div class="ctxSeparator" role="separator"></div>
+    <button type="button" data-action="quit">Quit Program</button>
+  `;
+  document.body.appendChild(canvasContextMenu);
+
+  canvasContextMenu.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-action]");
+    if (!btn || btn.disabled) return;
+    const action = btn.dataset.action;
+    const videoId = contextMenuVideoTileId;
+    hideCanvasContextMenu();
+    if (action === "fit") fitContentToTiles();
+    else if (action === "align") optimalAlignToTiles();
+    else if (action === "four-tiles") layoutFourTiles();
+    else if (action === "close-video") {
+      if (videoId) deleteTile(videoId);
+    } else if (action === "minimize") void minimizeWindow();
+    else if (action === "maximize") void toggleMaximizeWindow();
+    else if (action === "quit") void quitProgram();
+  });
+
+  canvas.addEventListener("contextmenu", (e) => {
+    if (e.target.closest?.("#titleBar")) return;
+    e.preventDefault();
+    showCanvasContextMenu(e.clientX, e.clientY);
+  });
+
+  document.addEventListener("pointerdown", (e) => {
+    if (!canvasContextMenu || canvasContextMenu.classList.contains("hidden")) return;
+    if (e.target.closest?.("#canvasContextMenu")) return;
+    hideCanvasContextMenu();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") hideCanvasContextMenu();
+  });
 }
 
 function fmt(sec) {
@@ -1645,6 +2606,21 @@ initWindowFocusHandling();
 
 document.addEventListener("keydown", (e) => {
   if (isHistoryKeyTarget(e.target)) return;
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "f") {
+    e.preventDefault();
+    fitContentToTiles();
+    return;
+  }
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "o") {
+    e.preventDefault();
+    optimalAlignToTiles();
+    return;
+  }
+  if (e.ctrlKey && !e.altKey && !e.metaKey && !e.shiftKey && e.key.toLowerCase() === "t") {
+    e.preventDefault();
+    layoutFourTiles();
+    return;
+  }
   if (e.ctrlKey && e.key === "z" && !e.shiftKey) {
     e.preventDefault();
     undo();
@@ -1723,7 +2699,10 @@ tauriListen("tauri://drag-drop", (event) => {
 initTitleBarVisibility();
 initTopBarDragZone();
 initWindowControls();
+initTileWheelResize();
+initCanvasContextMenu();
 initWindowSizePersistence();
+void initCloseHandling();
 document.getElementById("btnFitContent")?.addEventListener("click", (e) => {
   e.preventDefault();
   e.stopPropagation();
@@ -1732,47 +2711,26 @@ document.getElementById("btnFitContent")?.addEventListener("click", (e) => {
 loadSavedTiles();
 
 function initWindowControls() {
-  const label = "main";
   const btnMinimize = document.getElementById("btnMinimize");
   const btnMaximize = document.getElementById("btnMaximize");
   const btnClose = document.getElementById("btnClose");
 
-  if (!window.__TAURI_INTERNALS__?.invoke && !window.__TAURI__?.core?.invoke) {
+  if (!hasTauriWindow()) {
     return;
-  }
-
-  async function syncMaximizeIcon() {
-    if (!btnMaximize) return;
-    try {
-      const maximized = await tauriInvoke("plugin:window|is_maximized", {
-        label,
-      });
-      btnMaximize.textContent = maximized ? "❐" : "□";
-      btnMaximize.title = maximized ? "Restore" : "Maximize";
-    } catch {
-      /* ignore */
-    }
   }
 
   btnMinimize?.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    tauriInvoke("plugin:window|minimize", { label }).catch(console.error);
+    void minimizeWindow();
   });
   btnMaximize?.addEventListener("click", async (e) => {
     e.preventDefault();
     e.stopPropagation();
-    try {
-      await tauriInvoke("plugin:window|toggle_maximize", { label });
-      syncMaximizeIcon();
-    } catch (err) {
-      console.error(err);
-    }
+    await toggleMaximizeWindow();
   });
   const closeWindow = () => {
-    flushSaveState();
-    destroyEmbedsBeforeClose();
-    tauriInvoke("plugin:window|close", { label }).catch(console.error);
+    void quitProgram();
   };
   btnClose?.addEventListener("pointerdown", (e) => {
     if (e.button !== 0) return;
@@ -1785,5 +2743,5 @@ function initWindowControls() {
     e.stopPropagation();
   });
 
-  syncMaximizeIcon();
+  syncMaximizeButtonIcon();
 }

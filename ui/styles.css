@@ -17,7 +17,8 @@ html, body {
   top: 0;
   left: 0;
   right: 0;
-  z-index: 1000;
+  /* Keep below TWITCH_Z_BASE in app.js so Twitch iframes are not obscured on hover. */
+  z-index: 200000;
   display: flex;
   align-items: stretch;
   background: var(--panel);
@@ -113,16 +114,26 @@ html, body {
   resize: both;
 }
 .tile.selected { border-color: var(--accent); }
+/* Pass wheel through local video so resize works over the frame. */
+.tile-video .tileBody video {
+  pointer-events: none;
+}
 .tileBody {
   position: absolute;
   inset: 0;
   overflow: hidden;
 }
 .tileBody video,
-.tileBody iframe,
 .tileBody img.tileImage,
-.tileBody > div[id^="tw-"],
 .tileBody .ytEmbedHost {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+.tile-embed:not(.tile-twitch) .tileBody iframe {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -173,15 +184,15 @@ html, body {
   border-bottom: none;
   border-top: none;
 }
-.tile-embed .tileBody:hover .tileDragHandle,
-.tile-embed .tileBody.is-hover .tileDragHandle,
-.tile-embed .tileBody:hover .tileDragHandleBottom,
-.tile-embed .tileBody.is-hover .tileDragHandleBottom {
+.tile-embed:not(.tile-twitch) .tileBody:hover .tileDragHandle,
+.tile-embed:not(.tile-twitch) .tileBody.is-hover .tileDragHandle,
+.tile-embed:not(.tile-twitch) .tileBody:hover .tileDragHandleBottom,
+.tile-embed:not(.tile-twitch) .tileBody.is-hover .tileDragHandleBottom {
   opacity: 0;
   pointer-events: auto;
 }
-.tile-embed .tileBody:hover .tileDeleteBtn,
-.tile-embed .tileBody.is-hover .tileDeleteBtn {
+.tile-embed:not(.tile-twitch) .tileBody:hover .tileDeleteBtn,
+.tile-embed:not(.tile-twitch) .tileBody.is-hover .tileDeleteBtn {
   opacity: 1;
   pointer-events: auto;
 }
@@ -208,8 +219,16 @@ html, body {
   visibility: visible !important;
   opacity: 1 !important;
 }
-.tile-twitch.twitch-paused .twitchEmbedHost iframe {
-  pointer-events: auto !important;
+.tile-twitch .twitchEmbedHost iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+.tile-twitch.twitch-paused:not(.twitch-needs-activation) .twitchEmbedHost iframe {
+  pointer-events: none !important;
 }
 .tile-twitch.twitch-playing:not(.twitch-needs-activation) .twitchEmbedHost iframe {
   pointer-events: none !important;
@@ -218,14 +237,17 @@ html, body {
   display: flex;
   flex-direction: column;
 }
-.twitchEmbedHost {
+.tile-twitch .twitchEmbedHost,
+.tile-twitch .twitchPlaceholder {
   position: relative;
+  inset: auto;
   flex: 1 1 auto;
+  order: 1;
   min-height: 300px;
   width: 100%;
   z-index: 1;
 }
-.twitchPlaceholder {
+.tile-twitch .twitchPlaceholder {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -236,6 +258,18 @@ html, body {
 }
 .ytEmbedHost {
   z-index: 1;
+}
+/* YouTube iframe is cross-origin — wheel/click shield sits above it for resize + optional controls. */
+.ytWheelShield {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: auto;
+  background: transparent;
+}
+.tile-embed.yt-controls-mode .ytWheelShield {
+  pointer-events: none;
+  visibility: hidden;
 }
 .ytPlaceholder {
   display: flex;
@@ -258,6 +292,7 @@ html, body {
   gap: 6px;
   position: relative;
   flex: 0 0 auto;
+  order: 2;
   z-index: 12;
   opacity: 1;
   pointer-events: auto;
@@ -314,23 +349,13 @@ html, body {
   background: #c42b1c;
   color: #fff;
 }
-.tile-twitch .tileDragHandle {
+.tile-twitch .tileDragHandle,
+.tile-twitch .tileBody:hover .tileDragHandle,
+.tile-twitch .tileBody.is-hover .tileDragHandle {
   z-index: 10;
-  pointer-events: auto;
-  opacity: 0;
-  cursor: grab;
-  background: transparent;
-}
-.tile-twitch.twitch-paused .tileBody:hover .tileDragHandle,
-.tile-twitch.twitch-paused .tileBody.is-hover .tileDragHandle {
-  opacity: 0.35;
-  background: var(--panel);
-}
-.tile-twitch.twitch-playing .tileDragHandle,
-.tile-twitch.twitch-playing .tileBody:hover .tileDragHandle,
-.tile-twitch.twitch-playing .tileBody.is-hover .tileDragHandle {
   opacity: 0 !important;
   pointer-events: none !important;
+  cursor: grab;
   background: transparent !important;
 }
 .tileDeleteBtn {
@@ -421,3 +446,52 @@ html, body {
   font-size: 13px; z-index: 99;
 }
 .toast.hidden { display: none; }
+.canvasContextMenu {
+  position: fixed;
+  z-index: 2000;
+  min-width: 180px;
+  padding: 4px;
+  border-radius: 6px;
+  background: var(--panel);
+  border: 1px solid #444;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.canvasContextMenu.hidden {
+  display: none;
+}
+.canvasContextMenu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  border: 0;
+  border-radius: 4px;
+  padding: 8px 10px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.canvasContextMenu button:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.canvasContextMenu button:disabled {
+  color: var(--muted);
+  opacity: 0.45;
+  cursor: default;
+}
+.canvasContextMenu button:disabled:hover {
+  background: transparent;
+}
+.canvasContextMenu .ctxSeparator {
+  height: 1px;
+  margin: 4px 8px;
+  background: #444;
+}
+.canvasContextMenu .ctxShortcut {
+  color: var(--muted);
+  font-size: 12px;
+}

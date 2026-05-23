@@ -41,7 +41,7 @@ export function parseMediaInput(raw) {
   return { kind: "unknown", url: text };
 }
 
-export function extractYoutubeId(url) {
+function extractYoutubeId(url) {
   try {
     const u = new URL(url);
     if (u.hostname === "youtu.be") {
